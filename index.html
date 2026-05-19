@@ -456,9 +456,9 @@ const sb = {
     const remote = await this._req('GET', table, null, `?id=eq.${encodeURIComponent(row.id)}&select=id,updated_at,is_deleted`);
     if(remote && remote.length > 0){
       const r = remote[0];
-      // ① リモートが削除済み → ローカルの変更で復元しない
-      if(r.is_deleted && !row.is_deleted){
-        console.log(`[SB] Push skipped: remote is deleted (${row.id})`);
+      // ① リモートが削除済み かつ ローカルより新しい → push スキップ（削除が優先）
+      if(r.is_deleted && !row.is_deleted && r.updated_at >= row.updated_at){
+        console.log(`[SB] Push skipped: remote is deleted and newer (${row.id})`);
         // ローカルも削除済みに揃える
         const local = await localDB[table].get(row.id);
         if(local && !local.is_deleted){
@@ -466,8 +466,8 @@ const sb = {
         }
         return null;
       }
-      // ② リモートの方が新しい → push スキップ
-      if(r.updated_at > row.updated_at){
+      // ② リモートの方が新しい（かつ削除でない） → push スキップ
+      if(!r.is_deleted && r.updated_at > row.updated_at){
         console.log(`[SB] Push skipped: remote is newer (${row.id})`);
         return null;
       }
@@ -490,8 +490,13 @@ async function applyUpsertRule(table, remote){
     await localDB[table].put({...existing, ...remote, is_deleted:true});
     return 'force_deleted';
   }
-  // ② ローカルが既に削除済み → 復元しない
-  if(existing.is_deleted){
+  // ② ローカルが削除済みでもリモートが is_deleted:false かつ新しければ復元する
+  //    （端末Aで追加したカテゴリが端末Bで「削除済み」と表示されるバグの修正）
+  if(existing.is_deleted && !remote.is_deleted){
+    if(remote.updated_at >= existing.updated_at){
+      await localDB[table].put(remote);
+      return 'restored';
+    }
     return 'skip_local_deleted';
   }
   // ③ updated_at 比較
