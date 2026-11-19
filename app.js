@@ -61,8 +61,68 @@ async function saveExpense(id){const category_id=$('f-category').value,payment_m
 async function deleteExpense(id){const old=await db.expenses.get(id);if(!old)return;await queue('expenses',touch({...old,is_deleted:true}));closeModal();render();syncAll();}
 async function restoreExpense(id){const old=await db.expenses.get(id);if(!old)return;await queue('expenses',touch({...old,is_deleted:false}));closeModal();render();syncAll();}
 async function openManager(type){activeManager=type;await renderManager();}
-async function renderManager(){const type=activeManager;const names={categories:'カテゴリ管理',payment_methods:'支払方法管理',credit_cards:'クレジットカード管理',recurring_expenses:'繰り返し支出'};const rows=await all(type);if(type==='categories'||type==='payment_methods')rows.sort((a,b)=>(a.sort_order||0)-(b.sort_order||0));let html='<p class="notice">項目を長押しして移動すると並び順を変更できます。</p>';for(const r of rows){let desc='';if(type==='payment_methods')desc=r.is_default?'メインの支払方法':r.kind==='card'?'クレジットカード':'';if(type==='recurring_expenses')desc=`${{weekly:'毎週',monthly:'毎月',yearly:'毎年'}[r.frequency]} · ${yen(r.amount)}${r.paused?' · 停止中':''}`;html+=`<div class="setting-item" ${['categories','payment_methods'].includes(type)?`draggable="true" data-id="${r.id}" ondragstart="dragStart(event)" ondragover="event.preventDefault()" ondrop="dragDrop(event,'${type}')"`:''}><div style="flex:1;min-width:0"><b>${esc(r.name||r.memo||r.start_date)}</b><div class="sub">${esc(desc)}</div></div>${type==='payment_methods'&&!r.is_default?`<button class="btn small secondary" onclick="setDefault('${r.id}')">メイン</button>`:''}<button class="btn small secondary" onclick="openEditor('${type}','${r.id}')">編集</button></div>`;}html+=rows.length?'':'<div class="empty">まだ登録されていません</div>';const add=type==='credit_cards'?'カードを追加':type==='recurring_expenses'?'繰り返し支出を追加':'追加する';openModal(names[type],html,`<button class="btn secondary" onclick="closeModal()">閉じる</button><button class="btn" onclick="openEditor('${type}')">${add}</button>`);}
-let draggedId='';function dragStart(event){draggedId=event.currentTarget.dataset.id;}async function dragDrop(event,type){event.preventDefault();const target=event.currentTarget.dataset.id;if(!draggedId||draggedId===target)return;const rows=(await all(type)).sort((a,b)=>(a.sort_order||0)-(b.sort_order||0));const ids=rows.map(r=>r.id),from=ids.indexOf(draggedId),to=ids.indexOf(target);if(from<0||to<0)return;ids.splice(to,0,ids.splice(from,1)[0]);for(let i=0;i<ids.length;i++){const row=rows.find(r=>r.id===ids[i]);if(row.sort_order!==i)await queue(type,touch({...row,sort_order:i}));}await renderManager();syncAll();}
+async function renderManager(){const type=activeManager;const names={categories:'カテゴリ管理',payment_methods:'支払方法管理',credit_cards:'クレジットカード管理',recurring_expenses:'繰り返し支出'};const rows=await all(type);if(type==='categories'||type==='payment_methods')rows.sort((a,b)=>(a.sort_order||0)-(b.sort_order||0));let html=['categories','payment_methods'].includes(type)?'<p class="notice">項目を長押しせず、そのまま上下にドラッグして並び替えできます。編集ボタンは通常どおりタップできます。</p>':'';for(const r of rows){let desc='';if(type==='payment_methods')desc=r.is_default?'メインの支払方法':r.kind==='card'?'クレジットカード':'';if(type==='recurring_expenses')desc=`${{weekly:'毎週',monthly:'毎月',yearly:'毎年'}[r.frequency]} · ${yen(r.amount)}${r.paused?' · 停止中':''}`;html+=`<div class="setting-item ${['categories','payment_methods'].includes(type)?'sortable-row':''}" ${['categories','payment_methods'].includes(type)?`data-id="${r.id}"`:''}><div style="flex:1;min-width:0"><b>${esc(r.name||r.memo||r.start_date)}</b><div class="sub">${esc(desc)}</div></div>${type==='payment_methods'&&!r.is_default?`<button class="btn small secondary" onclick="setDefault('${r.id}')">メイン</button>`:''}<button class="btn small secondary" onclick="openEditor('${type}','${r.id}')">編集</button></div>`;}html+=rows.length?'':'<div class="empty">まだ登録されていません</div>';const add=type==='credit_cards'?'カードを追加':type==='recurring_expenses'?'繰り返し支出を追加':'追加する';openModal(names[type],html,`<button class="btn secondary" onclick="closeModal()">閉じる</button><button class="btn" onclick="openEditor('${type}')">${add}</button>`);if(type==='categories'||type==='payment_methods')enableTouchSorting(type);}
+// Drag directly on each setting row. Buttons remain independently clickable.
+function enableTouchSorting(type){
+  const body=$('modal-body');
+  const rows=body.querySelectorAll('.sortable-row');
+  for(const source of rows){
+    source.addEventListener('pointerdown',event=>{
+      if(event.pointerType==='mouse'&&event.button!==0)return;
+      if(event.target.closest('button, input, select, textarea, a, [contenteditable]'))return;
+      event.preventDefault();
+      const sourceId=source.dataset.id;
+      let destinationId=sourceId;
+      let finished=false;
+      source.classList.add('sort-active');
+      source.setPointerCapture(event.pointerId);
+      const clear=()=>{
+        source.removeEventListener('pointermove',onMove);
+        source.removeEventListener('pointerup',finish);
+        source.removeEventListener('pointercancel',cancel);
+        source.classList.remove('sort-active');
+        body.querySelectorAll('.sort-over').forEach(row=>row.classList.remove('sort-over'));
+      };
+      const onMove=e=>{
+        e.preventDefault();
+        const target=document.elementFromPoint(e.clientX,e.clientY)?.closest('.sortable-row');
+        body.querySelectorAll('.sort-over').forEach(row=>row.classList.remove('sort-over'));
+        if(target&&body.contains(target)){
+          destinationId=target.dataset.id;
+          if(destinationId!==sourceId)target.classList.add('sort-over');
+        }
+        const bounds=body.getBoundingClientRect();
+        if(e.clientY<bounds.top+48)body.scrollTop-=12;
+        else if(e.clientY>bounds.bottom-48)body.scrollTop+=12;
+      };
+      const finish=async()=>{
+        if(finished)return;
+        finished=true;
+        clear();
+        if(destinationId!==sourceId){
+          try{await reorderSettings(type,sourceId,destinationId);}
+          catch(error){console.error(error);toast('並び替えに失敗しました');}
+        }
+      };
+      const cancel=()=>{finished=true;clear();};
+      source.addEventListener('pointermove',onMove);
+      source.addEventListener('pointerup',finish);
+      source.addEventListener('pointercancel',cancel);
+    });
+  }
+}
+async function reorderSettings(type,sourceId,targetId){
+  const rows=(await all(type)).sort((a,b)=>(a.sort_order||0)-(b.sort_order||0));
+  const ids=rows.map(row=>row.id),from=ids.indexOf(sourceId),to=ids.indexOf(targetId);
+  if(from<0||to<0||from===to)return;
+  ids.splice(to,0,ids.splice(from,1)[0]);
+  for(let i=0;i<ids.length;i++){
+    const row=rows.find(item=>item.id===ids[i]);
+    if(row.sort_order!==i)await queue(type,touch({...row,sort_order:i}));
+  }
+  await renderManager();
+  syncAll();
+}
 async function setDefault(id){const methods=await all('payment_methods');for(const m of methods.filter(m=>m.is_default&&m.id!==id))await queue('payment_methods',touch({...m,is_default:false}));const row=await db.payment_methods.get(id);await queue('payment_methods',touch({...row,is_default:true}));await renderManager();syncAll();}
 async function openEditor(type,id=''){const old=id?await db[type].get(id):null,{categories,methods}=await selectData();let fields='';const field=(name,label,control)=>`<div class="field"><label>${label}</label>${control}</div>`;
 if(type==='categories')fields=field('name','カテゴリ名',`<input id="v-name" maxlength="30" value="${esc(old?.name||'')}">`)+field('color','カラー',`<input id="v-color" type="color" value="${esc(old?.color||'#7c9bd7')}">`);
