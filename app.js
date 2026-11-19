@@ -14,6 +14,7 @@ const addMonths=(s,n)=>{const d=parseDate(s), y=d.getFullYear(),m=d.getMonth()+n
 const clampDay=(y,m,day)=>`${y}-${String(m).padStart(2,'0')}-${String(day===32?daysInMonth(y,m):Math.min(day,daysInMonth(y,m))).padStart(2,'0')}`;
 const uuid=()=>crypto.randomUUID();
 let currentPage='home',homeMode='graph',syncRunning=false,modalSave=null,activeManager=null;
+let authClient=null,authSession=null,authenticatedUserId=null;
 function toast(message){$('toast').textContent=message;$('toast').classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').classList.remove('show'),3200);}
 async function all(table,includeDeleted=false){const rows=await db[table].toArray();return includeDeleted?rows:rows.filter(r=>!r.is_deleted);}
 async function queue(table,row){await db.transaction('rw',db[table],db.pending,async()=>{await db[table].put(row);const old=await db.pending.where('[table+id]').equals([table,row.id]).first();if(old)await db.pending.update(old.key,{row});else await db.pending.add({table,id:row.id,row});});updateSyncLabel();}
@@ -159,9 +160,69 @@ async function deterministicId(input){const data=new TextEncoder().encode(input)
 function occurrenceDate(start,frequency,index){if(frequency==='weekly')return addDays(start,index*7);const [y,m,d]=start.split('-').map(Number);if(frequency==='monthly'){const first=new Date(y,m-1+index,1,12);return clampDay(first.getFullYear(),first.getMonth()+1,d);}return clampDay(y+index,m,d);}
 async function generateRecurring(){const today=localDate(),templates=await all('recurring_expenses');for(const t of templates){if(t.paused||!t.start_date||t.start_date>today)continue;for(let i=0;i<5000;i++){const date=occurrenceDate(t.start_date,t.frequency,i);if(date>today||t.end_date&&date>t.end_date)break;const id=await deterministicId(t.id+'|'+date);if(await db.expenses.get(id))continue;const n=iso();await queue('expenses',{id,category_id:t.category_id,payment_method_id:t.payment_method_id,amount:t.amount,memo:t.memo||'',expense_date:date,recurring_expense_id:t.id,recurrence_date:date,is_individually_modified:false,is_deleted:false,created_at:n,updated_at:n});}}}
 // ローカル未同期レコードを先に送信し、成功した分だけキューから削除する。
-async function remote(method,table,body){const res=await fetch(`${CONFIG.url}/rest/v1/${table}${method==='GET'?'?select=*':''}`,{method,headers:{apikey:CONFIG.key,Authorization:`Bearer ${CONFIG.key}`,'Content-Type':'application/json',Prefer:method==='POST'?'resolution=merge-duplicates,return=minimal':'return=representation'},body:body?JSON.stringify(body):undefined});if(!res.ok)throw Error(`${table}: HTTP ${res.status} ${await res.text()}`);return method==='GET'?res.json():null;}
+async function remote(method,table,body){if(!authSession?.access_token)throw Error('ログインが必要です');const res=await fetch(`${CONFIG.url}/rest/v1/${table}${method==='GET'?'?select=*':''}`,{method,headers:{apikey:CONFIG.key,Authorization:`Bearer ${authSession.access_token}`,'Content-Type':'application/json',Prefer:method==='POST'?'resolution=merge-duplicates,return=minimal':'return=representation'},body:body?JSON.stringify(body):undefined});if(!res.ok)throw Error(`${table}: HTTP ${res.status} ${await res.text()}`);return method==='GET'?res.json():null;}
 async function updateSyncLabel(error=false){const n=await db.pending.count();$('sync-status').textContent=error||!navigator.onLine?`● 未同期 ${n}件`:`${n?'◌ 未同期 '+n+'件':'✓ 同期済み'}`;$('sync-detail').textContent=`未同期 ${n}件 ／ ${navigator.onLine?'オンライン':'オフライン'}`;}
-async function syncAll(){if(syncRunning)return;syncRunning=true;let error=false;try{if(!navigator.onLine)throw Error('オフラインです');await generateRecurring();for(const p of await db.pending.orderBy('key').toArray()){await remote('POST',p.table,[p.row]);const current=await db.pending.get(p.key);if(current&&current.row.updated_at===p.row.updated_at)await db.pending.delete(p.key);}for(const table of TABLES){const rows=await remote('GET',table);for(const row of rows){if(await db.pending.where('[table+id]').equals([table,row.id]).count())continue;await db[table].put(row);}}await generateRecurring();for(const p of await db.pending.orderBy('key').toArray()){await remote('POST',p.table,[p.row]);const current=await db.pending.get(p.key);if(current&&current.row.updated_at===p.row.updated_at)await db.pending.delete(p.key);}await render();}catch(e){error=true;console.warn('[Sync]',e);toast('同期できませんでした。ローカルデータは保持しています。');}finally{syncRunning=false;await updateSyncLabel(error);}}
-async function initialize(){if(typeof Dexie==='undefined'){alert('Dexieを読み込めません。通信環境を確認してください。');return;}const today=localDate();$('month-caption').textContent=`${parseDate(today).getFullYear()}年${parseDate(today).getMonth()+1}月`;$('summary-month').value=today.slice(0,7);$('edit-month').value=today.slice(0,7);const existing=await db.meta.get('initialized_categories');
+async function syncAll(){if(!authSession?.access_token||!authenticatedUserId)return;if(syncRunning)return;syncRunning=true;let error=false;try{if(!navigator.onLine)throw Error('オフラインです');await generateRecurring();for(const p of await db.pending.orderBy('key').toArray()){await remote('POST',p.table,[p.row]);const current=await db.pending.get(p.key);if(current&&current.row.updated_at===p.row.updated_at)await db.pending.delete(p.key);}for(const table of TABLES){const rows=await remote('GET',table);for(const row of rows){if(await db.pending.where('[table+id]').equals([table,row.id]).count())continue;await db[table].put(row);}}await generateRecurring();for(const p of await db.pending.orderBy('key').toArray()){await remote('POST',p.table,[p.row]);const current=await db.pending.get(p.key);if(current&&current.row.updated_at===p.row.updated_at)await db.pending.delete(p.key);}await render();}catch(e){error=true;console.warn('[Sync]',e);toast('同期できませんでした。ローカルデータは保持しています。');}finally{syncRunning=false;await updateSyncLabel(error);}}
+async function initialize(){if(!authenticatedUserId)throw Error('認証が必要です');if(typeof Dexie==='undefined'){alert('Dexieを読み込めません。通信環境を確認してください。');return;}const today=localDate();$('month-caption').textContent=`${parseDate(today).getFullYear()}年${parseDate(today).getMonth()+1}月`;$('summary-month').value=today.slice(0,7);$('edit-month').value=today.slice(0,7);const existing=await db.meta.get('initialized_categories');
 if(!(await db.payment_methods.count())){const n=iso();await queue('payment_methods',{id:'22222222-0000-4000-8000-000000000001',name:'現金',kind:'cash',is_default:true,sort_order:0,created_at:n,updated_at:n,is_deleted:false});}if(!existing){const count=await db.categories.count();if(count===0){for(let i=0;i<DEFAULT_CATS.length;i++){const [id,name,color]=DEFAULT_CATS[i],n=iso();await queue('categories',{id,name,color,sort_order:i,created_at:n,updated_at:n,is_deleted:false});}}await db.meta.put({key:'initialized_categories',value:true});}await generateRecurring();await render();await updateSyncLabel();syncAll();if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(console.warn);}
-window.addEventListener('online',()=>syncAll());window.addEventListener('offline',()=>updateSyncLabel(true));document.addEventListener('visibilitychange',()=>{if(!document.hidden)syncAll();});initialize().catch(e=>{console.error(e);toast('初期化に失敗しました: '+e.message);});
+// Auth bootstrap: the UI is hidden until a verified Supabase Auth session is available.
+function authView(show){$('auth-screen').classList.toggle('hide',!show);$('app-shell').classList.toggle('hide',show);$('fab').classList.toggle('hide',show||currentPage!=='home');$('bottom-tabs').classList.toggle('hide',show);}
+function authMessage(message){$('auth-error').textContent=message||'';}
+async function login(){
+  const username=$('auth-username').value.trim(),password=$('auth-password').value;
+  const email=CONFIG.authUsers?.[username];
+  if(!email||!password){authMessage('ユーザー名またはパスワードが正しくありません。');return;}
+  $('auth-submit').disabled=true;authMessage('');
+  try{
+    const {data,error}=await authClient.auth.signInWithPassword({email,password});
+    if(error||!data.session)throw Error('認証できませんでした。');
+    $('auth-password').value='';
+    await acceptSession(data.session);
+  }catch(e){console.warn('[Auth]',e);authMessage('ログインできませんでした。ユーザー名とパスワードを確認してください。');}
+  finally{$('auth-submit').disabled=false;}
+}
+async function acceptSession(session){
+  if(!session?.user?.id||!session.access_token){authView(true);return;}
+  // The same shared budget can be used by two authorized accounts, but local cache is user-specific.
+  const uid=session.user.id;
+  const previous=localStorage.getItem('kakeibo-local-user');
+  if(previous&&previous!==uid){
+    const pending=await db.pending.count();
+    if(pending)throw Error('別ユーザーの未同期データがあります。元のユーザーで同期してから切り替えてください。');
+    await db.delete();await db.open();
+  }
+  localStorage.setItem('kakeibo-local-user',uid);
+  authSession=session;authenticatedUserId=uid;
+  authView(false);
+  if(!window.kakeiboInitialized){window.kakeiboInitialized=true;await initialize();}
+  else{await render();syncAll();}
+}
+async function logout(){
+  if(await db.pending.count()){toast('未同期データがあります。同期後にログアウトしてください。');return;}
+  if(!confirm('ログアウトしますか？この端末の家計簿キャッシュを削除します。'))return;
+  await authClient.auth.signOut();authSession=null;authenticatedUserId=null;
+  await db.delete();await db.open();
+  localStorage.removeItem('kakeibo-local-user');
+  window.kakeiboInitialized=false;
+  authView(true);authMessage('');
+}
+async function bootstrapAuth(){
+  authView(true);
+  if(!CONFIG.url||!CONFIG.key||!CONFIG.authUsers||!Object.keys(CONFIG.authUsers).length){authMessage('config.js にログインユーザーを設定してください。');return;}
+  if(!window.supabase?.createClient){authMessage('認証ライブラリを読み込めませんでした。');return;}
+  authClient=window.supabase.createClient(CONFIG.url,CONFIG.key,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:false}});
+  authClient.auth.onAuthStateChange((event,session)=>{
+    if(event==='TOKEN_REFRESHED'&&session)authSession=session;
+    if(event==='SIGNED_OUT'){authSession=null;authenticatedUserId=null;authView(true);}
+  });
+  try{
+    const {data,error}=await authClient.auth.getSession();if(error)throw error;
+    if(data.session){
+      const {data:userData,error:userError}=await authClient.auth.getUser();
+      if(userError||!userData.user)throw userError||Error('認証情報を検証できません');
+      await acceptSession(data.session);
+    }
+  }catch(e){console.warn('[Auth]',e);authMessage('セッションを確認できませんでした。再ログインしてください。');}
+}
+window.addEventListener('online',()=>syncAll());window.addEventListener('offline',()=>{if(authenticatedUserId)updateSyncLabel(true);});document.addEventListener('visibilitychange',()=>{if(!document.hidden&&authenticatedUserId)syncAll();});
+bootstrapAuth().catch(e=>{console.error(e);authMessage('初期化に失敗しました。画面を再読み込みしてください。');});
