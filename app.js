@@ -193,7 +193,12 @@ async function acceptSession(session){
   }
   localStorage.setItem('kakeibo-local-user',uid);
   authSession=session;authenticatedUserId=uid;
+  // Close the mobile keyboard before revealing the application. A focused input
+  // can leave the visual viewport scrolled after the login overlay disappears.
+  if(document.activeElement instanceof HTMLElement)document.activeElement.blur();
   authView(false);
+  window.scrollTo({top:0,left:0,behavior:'instant'});
+  requestAnimationFrame(()=>requestAnimationFrame(()=>window.scrollTo(0,0)));
   if(!window.kakeiboInitialized){window.kakeiboInitialized=true;await initialize();}
   else{await render();syncAll();}
 }
