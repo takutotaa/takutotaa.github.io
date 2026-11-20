@@ -1,4 +1,4 @@
-const CACHE='kakeibo-v2-8';
+const CACHE='kakeibo-v2-9';
 const DEXIE='https://unpkg.com/dexie@3.2.4/dist/dexie.js';
 self.addEventListener('install',event=>event.waitUntil((async()=>{
   const cache=await caches.open(CACHE);
